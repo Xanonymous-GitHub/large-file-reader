@@ -9,7 +9,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use memchr::memmem::Finder;
+use memchr::{memchr_iter, memmem::Finder};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 const BACK_SCAN_LIMIT: u64 = 1024 * 1024;
@@ -403,8 +404,57 @@ fn temp_format_path() -> PathBuf {
     ))
 }
 
+pub fn syntax_for_path(syntax_set: &SyntaxSet, path: impl AsRef<Path>) -> Option<&SyntaxReference> {
+    let path = path.as_ref();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        let extension = extension.to_ascii_lowercase();
+        for alias in syntax_extension_aliases(&extension) {
+            if let Some(syntax) = syntax_set.find_syntax_by_extension(alias) {
+                return Some(syntax);
+            }
+        }
+    }
+
+    syntax_set.find_syntax_for_file(path).ok().flatten()
+}
+
+#[must_use]
+pub fn syntax_name_for_path(path: impl AsRef<Path>) -> Option<String> {
+    let path = path.as_ref();
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    syntax_for_path(&syntax_set, path)
+        .map(|syntax| syntax.name.clone())
+        .or_else(|| fallback_syntax_name(path).map(str::to_owned))
+}
+
+fn fallback_syntax_name(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "toml" => Some("TOML"),
+        "ts" | "tsx" => Some("TypeScript"),
+        "jsonc" => Some("JSONC"),
+        "jsonl" => Some("JSON Lines"),
+        _ => None,
+    }
+}
+
+fn syntax_extension_aliases(extension: &str) -> Vec<&str> {
+    match extension {
+        "jsonc" | "jsonl" => vec!["json"],
+        "yml" => vec!["yaml"],
+        "jsx" => vec!["jsx", "js"],
+        "ts" => vec!["ts", "js"],
+        "tsx" => vec!["tsx", "ts", "js"],
+        "cc" | "cxx" | "hpp" | "hh" | "hxx" => vec!["cpp"],
+        "h" => vec!["c", "cpp"],
+        _ => vec![extension],
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisualLine {
+    pub line_number: u64,
+    pub next_line_number: u64,
     pub start_offset: u64,
     pub next_offset: u64,
     pub text: String,
@@ -440,6 +490,17 @@ impl LargeFile {
     }
 
     pub fn read_window(&mut self, start: u64, width: usize, height: usize) -> io::Result<Window> {
+        let line_number = self.line_number_at_offset(start)?;
+        self.read_window_from_line(start, width, height, line_number)
+    }
+
+    pub fn read_window_from_line(
+        &mut self,
+        start: u64,
+        width: usize,
+        height: usize,
+        start_line_number: u64,
+    ) -> io::Result<Window> {
         let start = start.min(self.len);
         if height == 0 {
             return Ok(Window {
@@ -456,6 +517,7 @@ impl LargeFile {
         let mut offset = start;
         let mut line_start = start;
         let mut skip_empty_newline_at = None;
+        let mut line_number = start_line_number.max(1);
 
         self.file.seek(SeekFrom::Start(start))?;
 
@@ -463,7 +525,13 @@ impl LargeFile {
             let read = self.file.read(&mut buf)?;
             if read == 0 {
                 if !bytes.is_empty() {
-                    lines.push(visual_line(line_start, offset, &bytes));
+                    lines.push(visual_line(
+                        line_number,
+                        line_number,
+                        line_start,
+                        offset,
+                        &bytes,
+                    ));
                 }
                 break;
             }
@@ -478,15 +546,28 @@ impl LargeFile {
                         if bytes.last() == Some(&b'\r') {
                             bytes.pop();
                         }
-                        lines.push(visual_line(line_start, offset, &bytes));
+                        lines.push(visual_line(
+                            line_number,
+                            line_number + 1,
+                            line_start,
+                            offset,
+                            &bytes,
+                        ));
                     }
                     bytes.clear();
                     line_start = offset;
+                    line_number += 1;
                 } else {
                     skip_empty_newline_at = None;
                     bytes.push(*byte);
                     if bytes.len() >= width {
-                        lines.push(visual_line(line_start, offset, &bytes));
+                        lines.push(visual_line(
+                            line_number,
+                            line_number,
+                            line_start,
+                            offset,
+                            &bytes,
+                        ));
                         bytes.clear();
                         line_start = offset;
                         skip_empty_newline_at = Some(line_start);
@@ -504,6 +585,54 @@ impl LargeFile {
             file_len: self.len,
             lines,
         })
+    }
+
+    pub fn line_offset(&mut self, line_number: u64) -> io::Result<u64> {
+        if line_number <= 1 {
+            return Ok(0);
+        }
+
+        let mut remaining_newlines = line_number - 1;
+        let mut offset = 0;
+        let mut buf = [0_u8; READ_CHUNK_SIZE];
+
+        self.file.seek(SeekFrom::Start(0))?;
+        loop {
+            let read = self.file.read(&mut buf)?;
+            if read == 0 {
+                return Ok(self.len);
+            }
+
+            for index in memchr_iter(b'\n', &buf[..read]) {
+                remaining_newlines -= 1;
+                if remaining_newlines == 0 {
+                    return Ok(offset + index as u64 + 1);
+                }
+            }
+
+            offset += read as u64;
+        }
+    }
+
+    pub fn line_number_at_offset(&mut self, offset: u64) -> io::Result<u64> {
+        let target = offset.min(self.len);
+        let mut remaining = target;
+        let mut count = 0_u64;
+        let mut buf = [0_u8; READ_CHUNK_SIZE];
+
+        self.file.seek(SeekFrom::Start(0))?;
+        while remaining > 0 {
+            let read_len = usize::try_from(remaining.min(READ_CHUNK_SIZE as u64))
+                .expect("read chunk size fits usize");
+            let read = self.file.read(&mut buf[..read_len])?;
+            if read == 0 {
+                break;
+            }
+            count += memchr_iter(b'\n', &buf[..read]).count() as u64;
+            remaining -= read as u64;
+        }
+
+        Ok(count + 1)
     }
 
     pub fn previous_visual_offset(&mut self, offset: u64, width: usize) -> io::Result<u64> {
@@ -582,8 +711,16 @@ impl LargeFile {
     }
 }
 
-fn visual_line(start_offset: u64, next_offset: u64, bytes: &[u8]) -> VisualLine {
+fn visual_line(
+    line_number: u64,
+    next_line_number: u64,
+    start_offset: u64,
+    next_offset: u64,
+    bytes: &[u8],
+) -> VisualLine {
     VisualLine {
+        line_number,
+        next_line_number,
         start_offset,
         next_offset,
         text: String::from_utf8_lossy(bytes).into_owned(),
@@ -594,7 +731,7 @@ fn visual_line(start_offset: u64, next_offset: u64, bytes: &[u8]) -> VisualLine 
 mod tests {
     use super::{
         FormatUpdate, LargeFile, SEARCH_CHUNK_SIZE, SearchUpdate, TokenKind, format_json_file,
-        highlight_json_line, start_format, start_search,
+        highlight_json_line, start_format, start_search, syntax_name_for_path,
     };
     use std::{fs, io::Write, time::Duration};
     use tempfile::NamedTempFile;
@@ -672,6 +809,73 @@ mod tests {
         let mut reader = LargeFile::open(file.path()).expect("open temp json");
 
         assert_eq!(reader.near_end_offset(5, 2).expect("near end"), 10);
+    }
+
+    #[test]
+    fn given_wrapped_file_when_window_is_read_from_line_then_visual_lines_keep_physical_line_numbers()
+     {
+        let file = temp_json(b"alpha\nbravocharlie\n");
+        let mut reader = LargeFile::open(file.path()).expect("open temp file");
+
+        let window = reader
+            .read_window_from_line(0, 5, 4, 1)
+            .expect("read numbered window");
+
+        assert_eq!(window.lines[0].line_number, 1);
+        assert_eq!(window.lines[0].next_line_number, 1);
+        assert_eq!(window.lines[1].line_number, 2);
+        assert_eq!(window.lines[1].next_line_number, 2);
+        assert_eq!(window.lines[2].line_number, 2);
+        assert_eq!(window.lines[2].next_line_number, 2);
+        assert_eq!(window.lines[3].line_number, 2);
+        assert_eq!(window.lines[3].next_line_number, 3);
+    }
+
+    #[test]
+    fn given_vim_line_jump_target_when_resolving_offset_then_line_start_is_returned() {
+        let file = temp_json(b"one\ntwo\nthree");
+        let mut reader = LargeFile::open(file.path()).expect("open temp file");
+
+        assert_eq!(reader.line_offset(1).expect("line 1"), 0);
+        assert_eq!(reader.line_offset(2).expect("line 2"), 4);
+        assert_eq!(reader.line_offset(3).expect("line 3"), 8);
+        assert_eq!(reader.line_offset(99).expect("past eof"), reader.len());
+    }
+
+    #[test]
+    fn given_offsets_when_resolving_line_number_then_one_based_line_number_is_returned() {
+        let file = temp_json(b"one\ntwo\nthree");
+        let mut reader = LargeFile::open(file.path()).expect("open temp file");
+
+        assert_eq!(reader.line_number_at_offset(0).expect("line"), 1);
+        assert_eq!(reader.line_number_at_offset(4).expect("line"), 2);
+        assert_eq!(reader.line_number_at_offset(8).expect("line"), 3);
+        assert_eq!(reader.line_number_at_offset(reader.len()).expect("line"), 3);
+    }
+
+    #[test]
+    fn given_common_swe_file_names_when_selecting_syntax_then_a_non_plain_syntax_is_found() {
+        for file_name in [
+            "data.json",
+            "data.jsonc",
+            "events.jsonl",
+            "config.yaml",
+            "config.yml",
+            "Cargo.toml",
+            "README.md",
+            "app.js",
+            "app.ts",
+            "main.py",
+            "main.c",
+            "main.cpp",
+            "main.go",
+            "main.rs",
+        ] {
+            let syntax = syntax_name_for_path(file_name).unwrap_or_else(|| {
+                panic!("missing syntax for {file_name}");
+            });
+            assert_ne!(syntax, "Plain Text", "plain syntax for {file_name}");
+        }
     }
 
     #[test]

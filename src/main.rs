@@ -15,7 +15,7 @@ use crossterm::{
 };
 use large_json_reader::{
     FormatHandle, FormatUpdate, LargeFile, SearchHandle, SearchMatch, SearchUpdate, TokenKind,
-    Window, highlight_json_line, start_format, start_search,
+    VisualLine, Window, highlight_json_line, start_format, start_search, syntax_for_path,
 };
 use ratatui::{
     Frame, Terminal,
@@ -24,6 +24,11 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
+};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, Style as SyntectStyle, Theme, ThemeSet},
+    parsing::SyntaxSet,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -85,6 +90,7 @@ fn restore_tui(terminal: &mut Tui) -> io::Result<()> {
 enum InputMode {
     Normal,
     Search,
+    Command,
 }
 
 struct App {
@@ -92,8 +98,11 @@ struct App {
     active_path: PathBuf,
     reader: LargeFile,
     offset: u64,
+    line_number: u64,
     mode: InputMode,
     search_input: String,
+    command_input: String,
+    pending_count: String,
     search_query: String,
     search_handle: Option<SearchHandle>,
     search_matches: Vec<SearchMatch>,
@@ -101,6 +110,7 @@ struct App {
     format_requested: bool,
     format_handle: Option<FormatHandle>,
     formatted_path: Option<PathBuf>,
+    syntax_highlighter: SyntaxHighlighter,
     message: String,
 }
 
@@ -112,8 +122,11 @@ impl App {
             path,
             reader,
             offset: 0,
+            line_number: 1,
             mode: InputMode::Normal,
             search_input: String::new(),
+            command_input: String::new(),
+            pending_count: String::new(),
             search_query: String::new(),
             search_handle: None,
             search_matches: Vec::new(),
@@ -121,6 +134,7 @@ impl App {
             format_requested: false,
             format_handle: None,
             formatted_path: None,
+            syntax_highlighter: SyntaxHighlighter::new(),
             message: "ready".to_owned(),
         })
     }
@@ -154,6 +168,10 @@ impl App {
                     if self.current_match.is_none() {
                         self.current_match = Some(0);
                         self.offset = self.search_matches[0].offset;
+                        self.line_number = self
+                            .reader
+                            .line_number_at_offset(self.offset)
+                            .unwrap_or(self.line_number);
                     }
                     self.message = format!(
                         "match {}/{} for /{}",
@@ -244,19 +262,23 @@ impl App {
     fn move_down(&mut self, window: &Window) {
         if let Some(line) = window.lines.get(1) {
             self.offset = line.start_offset;
+            self.line_number = line.line_number;
         } else if let Some(line) = window.lines.first() {
             self.offset = line.next_offset.min(window.file_len);
+            self.line_number = line.next_line_number;
         }
     }
 
     fn move_up(&mut self, width: usize) -> io::Result<()> {
         self.offset = self.reader.previous_visual_offset(self.offset, width)?;
+        self.line_number = self.reader.line_number_at_offset(self.offset)?;
         Ok(())
     }
 
     fn page_down(&mut self, window: &Window) {
         if let Some(line) = window.lines.last() {
             self.offset = line.next_offset.min(window.file_len);
+            self.line_number = line.next_line_number;
         }
     }
 
@@ -268,6 +290,7 @@ impl App {
                 break;
             }
         }
+        self.line_number = self.reader.line_number_at_offset(self.offset)?;
         Ok(())
     }
 
@@ -275,6 +298,7 @@ impl App {
         let target = window.lines.len().saturating_div(2).max(1);
         if let Some(line) = window.lines.get(target) {
             self.offset = line.start_offset;
+            self.line_number = line.line_number;
         } else {
             self.page_down(window);
         }
@@ -286,17 +310,51 @@ impl App {
 
     fn go_top(&mut self) {
         self.offset = 0;
+        self.line_number = 1;
     }
 
     fn go_end(&mut self, width: usize, height: usize) -> io::Result<()> {
         self.offset = self.reader.near_end_offset(width, height)?;
+        self.line_number = self.reader.line_number_at_offset(self.offset)?;
+        Ok(())
+    }
+
+    fn jump_to_line(&mut self, line_number: u64) -> io::Result<()> {
+        let target = line_number.max(1);
+        self.offset = self.reader.line_offset(target)?;
+        self.line_number = self.reader.line_number_at_offset(self.offset)?;
+        self.message = format!("line {}", self.line_number);
         Ok(())
     }
 
     fn enter_search(&mut self) {
         self.mode = InputMode::Search;
         self.search_input.clear();
+        self.pending_count.clear();
         self.message = "enter search query".to_owned();
+    }
+
+    fn enter_command(&mut self) {
+        self.mode = InputMode::Command;
+        self.command_input.clear();
+        self.pending_count.clear();
+        self.message = "enter command".to_owned();
+    }
+
+    fn finish_command(&mut self) -> io::Result<bool> {
+        let command = self.command_input.trim().to_owned();
+        self.mode = InputMode::Normal;
+        if command == "q" {
+            return Ok(true);
+        }
+        if let Ok(line_number) = command.parse::<u64>() {
+            self.jump_to_line(line_number)?;
+        } else if command.is_empty() {
+            self.message = "empty command ignored".to_owned();
+        } else {
+            self.message = format!("unknown command: {command}");
+        }
+        Ok(false)
     }
 
     fn begin_search(&mut self) -> io::Result<()> {
@@ -347,6 +405,10 @@ impl App {
         };
         self.current_match = Some(next);
         self.offset = self.search_matches[next].offset;
+        self.line_number = self
+            .reader
+            .line_number_at_offset(self.offset)
+            .unwrap_or(self.line_number);
         self.message = format!("match {}/{} for /{}", next + 1, len, self.search_query);
     }
 
@@ -372,11 +434,14 @@ impl App {
         self.reader = LargeFile::open(&path)?;
         self.active_path = path;
         self.offset = 0;
+        self.line_number = 1;
         self.search_handle = None;
         self.search_matches.clear();
         self.current_match = None;
         self.search_query.clear();
         self.search_input.clear();
+        self.command_input.clear();
+        self.pending_count.clear();
         self.message = message;
         Ok(())
     }
@@ -389,6 +454,10 @@ impl App {
         } else {
             "raw"
         }
+    }
+
+    fn gutter_width_hint(&self, view_height: usize) -> usize {
+        digits(self.line_number + view_height as u64) + 2
     }
 }
 
@@ -408,11 +477,17 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> io::Result<()> {
         app.poll_background()?;
 
         let (term_width, term_height) = crossterm::terminal::size()?;
-        let view_width = usize::from(term_width.saturating_sub(2)).max(1);
         let view_height = usize::from(term_height.saturating_sub(3)).max(1);
-        let window = app
-            .reader
-            .read_window(app.offset, view_width, view_height)?;
+        let gutter_width = app.gutter_width_hint(view_height);
+        let view_width = usize::from(term_width)
+            .saturating_sub(2 + gutter_width)
+            .max(1);
+        let window = app.reader.read_window_from_line(
+            app.offset,
+            view_width,
+            view_height,
+            app.line_number,
+        )?;
 
         terminal.draw(|frame| render(frame, app, &window))?;
 
@@ -444,6 +519,20 @@ fn handle_key(
     if app.mode == InputMode::Search {
         return handle_search_key(app, key);
     }
+    if app.mode == InputMode::Command {
+        return handle_command_key(app, key);
+    }
+
+    if let KeyCode::Char(ch) = key.code
+        && ch.is_ascii_digit()
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        app.pending_count.push(ch);
+        app.message.clone_from(&app.pending_count);
+        return Ok(false);
+    }
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
@@ -458,13 +547,22 @@ fn handle_key(
             app.half_up(width, height)?;
         }
         KeyCode::Char('g') => app.go_top(),
-        KeyCode::Char('G') => app.go_end(width, height)?,
+        KeyCode::Char('G') => {
+            if app.pending_count.is_empty() {
+                app.go_end(width, height)?;
+            } else if let Ok(line_number) = app.pending_count.parse::<u64>() {
+                app.jump_to_line(line_number)?;
+            }
+        }
         KeyCode::Char('/') => app.enter_search(),
+        KeyCode::Char(':') => app.enter_command(),
         KeyCode::Char('n') => app.next_match(),
         KeyCode::Char('N') => app.previous_match(),
         KeyCode::Char('f') => app.toggle_format()?,
         _ => {}
     }
+
+    app.pending_count.clear();
 
     Ok(false)
 }
@@ -492,6 +590,29 @@ fn handle_search_key(app: &mut App, key: KeyEvent) -> io::Result<bool> {
     Ok(false)
 }
 
+fn handle_command_key(app: &mut App, key: KeyEvent) -> io::Result<bool> {
+    match key.code {
+        KeyCode::Esc => {
+            app.mode = InputMode::Normal;
+            app.message = "command cancelled".to_owned();
+        }
+        KeyCode::Enter => return app.finish_command(),
+        KeyCode::Backspace => {
+            app.command_input.pop();
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.command_input.push(ch);
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
 fn render(frame: &mut Frame<'_>, app: &App, window: &Window) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -504,18 +625,21 @@ fn render(frame: &mut Frame<'_>, app: &App, window: &Window) {
         (app.offset as f64 / window.file_len as f64) * 100.0
     };
     let title = format!(
-        " {} [{}]  {} / {} bytes ({percent:.1}%) ",
+        " {} [{}]  line {} byte {} / {} bytes ({percent:.1}%) ",
         app.active_path.display(),
         app.view_label(),
+        app.line_number,
         app.offset,
         window.file_len
     );
 
-    let body = window
-        .lines
-        .iter()
-        .map(|line| highlighted_line(&line.text, &app.search_query))
-        .collect::<Vec<_>>();
+    let gutter_width = gutter_width(window);
+    let body = app.syntax_highlighter.highlight_window(
+        &app.active_path,
+        window,
+        &app.search_query,
+        gutter_width,
+    );
     let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(Paragraph::new(body).block(block), chunks[0]);
 
@@ -530,6 +654,13 @@ fn status_line(app: &App) -> Line<'static> {
             Span::raw("  Enter search  Esc cancel"),
         ]);
     }
+    if app.mode == InputMode::Command {
+        return Line::from(vec![
+            Span::styled(" : ", key_style()),
+            Span::raw(app.command_input.clone()),
+            Span::raw("  Enter run  Esc cancel"),
+        ]);
+    }
 
     Line::from(vec![
         Span::raw(app.message.clone()),
@@ -542,18 +673,121 @@ fn status_line(app: &App) -> Line<'static> {
         Span::raw("next/prev "),
         Span::styled(" f ", key_style()),
         Span::raw("format "),
+        Span::styled(" :line countG ", key_style()),
+        Span::raw("jump "),
         Span::styled(" j/k PgUp/PgDn g/G ", key_style()),
         Span::raw("move"),
     ])
 }
 
-fn highlighted_line(text: &str, query: &str) -> Line<'static> {
-    Line::from(
-        highlight_json_line(text)
-            .into_iter()
-            .flat_map(|token| split_search_spans(token.text, style_for(token.kind), query))
-            .collect::<Vec<_>>(),
-    )
+struct SyntaxHighlighter {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
+impl SyntaxHighlighter {
+    fn new() -> Self {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let themes = ThemeSet::load_defaults();
+        let theme = themes
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| themes.themes.values().next())
+            .cloned()
+            .expect("syntect ships default themes");
+
+        Self { syntax_set, theme }
+    }
+
+    fn highlight_window(
+        &self,
+        path: &PathBuf,
+        window: &Window,
+        query: &str,
+        gutter_width: usize,
+    ) -> Vec<Line<'static>> {
+        let syntax = syntax_for_path(&self.syntax_set, path);
+        let mut highlighter = syntax.map(|syntax| HighlightLines::new(syntax, &self.theme));
+
+        window
+            .lines
+            .iter()
+            .map(|line| {
+                let spans = if let Some(highlighter) = highlighter.as_mut() {
+                    match highlighter.highlight_line(&line.text, &self.syntax_set) {
+                        Ok(ranges) => ranges
+                            .into_iter()
+                            .flat_map(|(style, text)| {
+                                split_search_spans(text.to_owned(), syntect_style(style), query)
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(_) => fallback_spans(&line.text, query),
+                    }
+                } else {
+                    fallback_spans(&line.text, query)
+                };
+                numbered_line(line, gutter_width, spans)
+            })
+            .collect()
+    }
+}
+
+fn numbered_line(
+    line: &VisualLine,
+    gutter_width: usize,
+    mut spans: Vec<Span<'static>>,
+) -> Line<'static> {
+    let mut prefixed = Vec::with_capacity(spans.len() + 1);
+    prefixed.push(Span::styled(
+        format!("{:>width$} ", line.line_number, width = gutter_width - 1),
+        Style::default().fg(Color::DarkGray),
+    ));
+    prefixed.append(&mut spans);
+    Line::from(prefixed)
+}
+
+fn fallback_spans(text: &str, query: &str) -> Vec<Span<'static>> {
+    highlight_json_line(text)
+        .into_iter()
+        .flat_map(|token| split_search_spans(token.text, style_for(token.kind), query))
+        .collect()
+}
+
+fn gutter_width(window: &Window) -> usize {
+    let max_line = window
+        .lines
+        .last()
+        .map_or(1, |line| line.line_number.max(line.next_line_number));
+    digits(max_line) + 2
+}
+
+fn digits(mut value: u64) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        digits += 1;
+        value /= 10;
+    }
+    digits
+}
+
+fn syntect_style(style: SyntectStyle) -> Style {
+    let mut output = Style::default().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+
+    if style.font_style.contains(FontStyle::BOLD) {
+        output = output.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        output = output.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        output = output.add_modifier(Modifier::UNDERLINED);
+    }
+
+    output
 }
 
 fn split_search_spans(text: String, style: Style, query: &str) -> Vec<Span<'static>> {

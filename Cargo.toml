@@ -9,6 +9,7 @@ memchr = "2.8.0"
 ratatui = "0.30.0"
 serde-transcode = "1.1.1"
 serde_json = "1.0.149"
+syntect = "5.3.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
